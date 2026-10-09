@@ -1,0 +1,110 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Three platforms and three compilers, because "it has no dependencies" is a claim
+  # about portability and a claim needs a check. The corpus is committed, so none of
+  # these jobs installs anything.
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "linux / g++",     os: ubuntu-latest,  cxx: g++ }
+          - { name: "linux / clang++", os: ubuntu-latest,  cxx: clang++ }
+          - { name: "macos / clang++", os: macos-latest,   cxx: clang++ }
+          - { name: "windows / msvc",  os: windows-latest, cxx: msvc }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and test (unix)
+        if: matrix.cxx != 'msvc'
+        run: |
+          ${{ matrix.cxx }} --version
+          ${{ matrix.cxx }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+            tests/test_pdftext.cpp -o test_pdftext
+          ./test_pdftext tests/corpus
+          ${{ matrix.cxx }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+            cli/main.cpp -o pdftext
+          ./pdftext --version
+          ./pdftext tests/corpus/multipage.pdf
+          ./pdftext --json tests/corpus/cmap.pdf
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.cxx == 'msvc'
+
+      - name: build and test (msvc)
+        if: matrix.cxx == 'msvc'
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /O2 /EHsc /W4 /WX /utf-8 tests\test_pdftext.cpp /Fe:test_pdftext.exe
+          test_pdftext.exe tests\corpus
+          cl /nologo /std:c++17 /O2 /EHsc /W4 /WX /utf-8 cli\main.cpp /Fe:pdftext.exe
+          pdftext.exe --version
+          pdftext.exe tests\corpus\multipage.pdf
+
+  cmake:
+    name: cmake / ctest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
+
+  corpus:
+    # The fixtures are committed and the expectations are generated beside them. If the
+    # generator and the committed corpus ever disagree, the expectations have stopped
+    # being ground truth and become a rubber stamp -- so regeneration must be a no-op.
+    name: corpus reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: regenerate and diff
+        run: |
+          python tools/make_corpus.py
+          git diff --exit-code -- tests/corpus
+          echo "corpus regenerates byte-identically"
+
+  sanitizers:
+    # This parser is handed bytes from outside. Undefined behaviour on a malformed file
+    # is the failure mode that matters, so the hostile-input tests run under ASan/UBSan.
+    name: asan + ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build instrumented
+        run: |
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
+              -fno-omit-frame-pointer tests/test_pdftext.cpp -o test_asan
+      - name: run
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./test_asan tests/corpus
+
+  fuzz-smoke:
+    # Not a real fuzzing campaign: a short deterministic sweep that mutates the corpus
+    # and asserts the parser returns instead of crashing. Cheap, and it has caught the
+    # kind of truncation a hand-written fixture does not think of.
+    name: mutation smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: build instrumented cli
+        run: |
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined \
+              cli/main.cpp -o pdftext_asan
+      - name: sweep
+        run: python tools/mutate.py ./pdftext_asan tests/corpus

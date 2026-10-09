@@ -1,0 +1,15 @@
+# The corpus fixtures are binary. Without this, a checkout on Windows rewrites LF to
+# CRLF inside the PDFs -- which corrupts the compressed streams, and makes the
+# "corpus regenerates byte-identically" check fail for reasons that have nothing to do
+# with the parser.
+*.pdf binary
+
+# Everything else is text with LF endings everywhere, so the generated .expected.txt
+# files compare equal no matter which platform regenerated them.
+* text=auto eol=lf
+*.h    text eol=lf
+*.cpp  text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+Makefile text eol=lf

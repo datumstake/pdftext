@@ -1,0 +1,17 @@
+pdftext
+pdftext.exe
+test_pdftext
+test_pdftext.exe
+build_test.exe
+fields
+fields.exe
+pdftext_asan
+*.obj
+*.o
+*.exp
+*.lib
+*.pdb
+*.ilk
+build/
+mutants/
+__pycache__/
