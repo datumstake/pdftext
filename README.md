@@ -263,7 +263,7 @@ Built by **[datumstake](https://github.com/datumstake)** — available for contr
 document extraction, developer tooling, and systems that have to work offline.
 The rest of the set:
 
-[adapt-engine](https://github.com/datumstake/adapt-engine) — resolve a whole class of porting gaps from rules that carry their own proof ·
-[self-verifying-ratchet](https://github.com/datumstake/self-verifying-ratchet) — automation that cannot grade its own work ·
-[browser-pilot](https://github.com/datumstake/browser-pilot) — a real, logged-in Chrome through a handful of one-word verbs ·
-[focus-three](https://github.com/datumstake/focus-three) — three tasks, one timer, nothing else
+[gapsmith](https://github.com/datumstake/gapsmith) — resolve a whole class of porting gaps from rules that carry their own proof ·
+[ratchet](https://github.com/datumstake/ratchet) — automation that cannot grade its own work ·
+[handle](https://github.com/datumstake/handle) — a logged-in Chrome, nine verbs ·
+[focus-three](https://github.com/datumstake/focus-three) — three tasks, one timer, nothing else — a 153 KB native Windows app

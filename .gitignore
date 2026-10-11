@@ -15,3 +15,8 @@ pdftext_asan
 build/
 mutants/
 __pycache__/
+pdftext
+test_pdftext
+*.exe
+*.obj
+obj_*
