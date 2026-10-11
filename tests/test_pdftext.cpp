@@ -244,6 +244,45 @@ static void test_reflow_grouping() {
     eq(tight.size(), (size_t)4, "reflow: tolerance splits a near-baseline");
 }
 
+// ------------------------------------------------------- short reads are reported
+static void test_a_short_stream_is_reported() {
+    // The bug this pins, measured 2026-10-11: cutting flate.pdf's 96-byte compressed
+    // body in half printed "Flate compresse" and exited 0. inflate_raw returned
+    // `!out.empty()` on every EOF path -- "I got some bytes, call it success" -- so a
+    // half-decoded stream was indistinguishable from a whole one.
+    //
+    // Note what is asserted. NOT "truncated input produces no text": partial text is
+    // the right behaviour, because real PDFs are damaged in boring ways and half a
+    // page beats no page. What is asserted is that the caller is TOLD.
+    std::vector<uint8_t> buf;
+    if (!read_file(corpus_dir + "/flate.pdf", buf)) {
+        printf("  SKIP  flate.pdf missing\n");
+        return;
+    }
+
+    pdftext::Status whole;
+    auto full = pdftext::extract_text(buf, &whole);
+    ok(whole.streams > 0, "short read: the intact file decoded at least one stream");
+    ok(whole.complete(), "short read: the intact file reports complete");
+
+    // Cut the compressed body in half, leaving the file structurally intact.
+    std::string hay((const char*)buf.data(), buf.size());
+    size_t s0 = hay.find("stream");
+    size_t e0 = hay.find("endstream", s0);
+    ok(s0 != std::string::npos && e0 != std::string::npos, "short read: fixture shape");
+    if (s0 == std::string::npos || e0 == std::string::npos) return;
+    size_t body = s0 + 7;
+    size_t keep = (e0 - body) / 2;
+    std::string cuts = hay.substr(0, body + keep) + hay.substr(e0);
+    std::vector<uint8_t> cut(cuts.begin(), cuts.end());
+
+    pdftext::Status half;
+    auto part = pdftext::extract_text(cut, &half);
+    ok(!half.complete(), "short read: a halved stream reports INCOMPLETE");
+    eq(half.short_streams, 1, "short read: exactly one stream ended early");
+    ok(part.size() <= full.size(), "short read: partial text is still returned");
+}
+
 // ------------------------------------------------------------------ main
 int main(int argc, char** argv) {
     corpus_dir = (argc > 1) ? argv[1] : "tests/corpus";
@@ -261,6 +300,7 @@ int main(int argc, char** argv) {
     test_page_count();
     test_reflow_grouping();
     test_garbage_is_not_a_crash();
+    test_a_short_stream_is_reported();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;

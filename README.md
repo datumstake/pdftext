@@ -1,7 +1,7 @@
 # pdftext
 
 [![ci](https://github.com/datumstake/pdftext/actions/workflows/ci.yml/badge.svg)](https://github.com/datumstake/pdftext/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-132%20checks-success)](tests/test_pdftext.cpp)
+[![tests](https://img.shields.io/badge/tests-138%20checks-success)](tests/test_pdftext.cpp)
 [![platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-blue)](.github/workflows/ci.yml)
 [![dependencies](https://img.shields.io/badge/dependencies-0-success)](pdftext.h)
 [![header only](https://img.shields.io/badge/header--only-1%20file-success)](pdftext.h)
@@ -139,8 +139,17 @@ namespace pdftext {
 struct TextItem { std::string text; double x, y; int page; };
 struct Line     { int page; double y; std::string text; };
 
+// Was the document decoded whole, or only partly?
+struct Status {
+    int  streams;        // compressed streams decoded
+    int  short_streams;  // ...of those, ones that ended before their last block
+    bool complete() const;
+};
+
 // Positioned fragments, in content-stream paint order.
-std::vector<TextItem> extract_text(const std::vector<uint8_t>& pdf_bytes);
+// Pass a Status if you need to know whether you got the WHOLE document.
+std::vector<TextItem> extract_text(const std::vector<uint8_t>& pdf_bytes,
+                                   Status* status = nullptr);
 
 // Group fragments into lines by baseline, then order down the page and left to right.
 std::vector<Line> reflow(const std::vector<TextItem>& items, double tol = 2.0);
@@ -157,6 +166,24 @@ step that infers one, so you can skip it when you want the raw geometry.
 
 The lower layers are public too, and occasionally that is what you came for:
 `inflate()`, `ascii85_decode()`, `pdf_unescape()`, `parse_cmaps()`.
+
+### Partial decodes are reported, not hidden
+
+A damaged PDF still gives you text, and that is deliberate — real files are broken in
+boring ways and half a page beats no page. But leniency has to be *reported*, or a
+caller treats half a document as a whole one:
+
+```cpp
+pdftext::Status st;
+auto items = pdftext::extract_text(bytes, &st);
+if (!st.complete())
+    fprintf(stderr, "%d of %d streams ended early
+", st.short_streams, st.streams);
+```
+
+The CLI does this for you: a short read prints a warning **to stderr** and exits **2**,
+while stdout stays clean so `--json` remains pipeable. Exit 0 means the text you are
+holding is the whole text.
 
 ### Working in coordinates
 
@@ -225,7 +252,7 @@ CI also runs the suite under **ASan + UBSan**, and a seeded [mutation
 sweep](tools/mutate.py) — 300+ truncated, byte-flipped and length-corrupted files —
 asserting a documented exit status every time. A malformed PDF is a result, not a crash.
 
-## Two defects this test suite found
+## Three defects this test suite found
 
 Both were in code that built clean and ran successfully, which is the only kind worth
 writing a test for.
@@ -234,6 +261,16 @@ writing a test for.
 and required every one to be in the ASCII85 alphabet — but on a stream shorter than that,
 the `~>` terminator falls *inside* the sample window and fails its own check. Every
 real-world stream is long enough to hide this. The fixture is not.
+
+**A halved stream decoded to half the text, silently, with exit 0.** `inflate_raw`
+returned `!out.empty()` on every EOF path — "I got some bytes, call it success" — so a
+truncated stream was indistinguishable from a whole one. Cutting `flate.pdf`'s 96-byte
+compressed body in half printed `Flate compresse` and exited 0. Five call sites also
+fed `bits()`'s `-1` EOF sentinel straight into arithmetic, happily computing a length
+from a stream that had already run out. The mutation sweep could not catch any of it:
+it asserts *no crash*, and this never crashed. Fixed by making completeness a return
+value — `Status` above — and the regression test asserts the short read is **detected**,
+not merely survived.
 
 **CMap streams were being read as page content.** A `/ToUnicode` CMap is a font resource,
 not something painted on a sheet, but the brute-force scan does not know that: it found

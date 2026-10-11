@@ -136,7 +136,19 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        auto items = pdftext::extract_text(buf);
+        pdftext::Status st;
+        auto items = pdftext::extract_text(buf, &st);
+        if (!st.complete()) {
+            // Say it, and mean it with the exit code. A half-decoded stream still
+            // yields text, and a caller who is never told treats that text as the
+            // whole document — which is how a wrong number reaches someone who
+            // acts on it. stdout stays clean so --json remains pipeable.
+            fprintf(stderr,
+                    "pdftext: %s: %d of %d stream(s) ended early"
+                    " - output is INCOMPLETE\n",
+                    path.c_str(), st.short_streams, st.streams);
+            status = 2;
+        }
         if (only_page >= 0) {
             std::vector<pdftext::TextItem> keep;
             for (const auto& it : items) if (it.page == only_page) keep.push_back(it);

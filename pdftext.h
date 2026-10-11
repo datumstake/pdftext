@@ -42,6 +42,24 @@
 
 namespace pdftext {
 
+// ---------------------------------------------------------------- completeness
+// A decode that ends early still produces text. The first version of this header
+// said `true` for that case — `inflate_raw` returned `!out.empty()` on every EOF
+// path, which means "I got some bytes, call it success" — so a stream cut in half
+// was indistinguishable from a whole one. Measured 2026-10-11: halving flate.pdf's
+// 96-byte compressed body printed "Flate compresse" instead of "Flate compressed
+// content stream / second line", and exited 0.
+//
+// That is the exact failure this library exists to avoid: not a crash, a plausible
+// wrong answer that nobody questions until someone acts on it. Leniency is still
+// the right default — real PDFs are damaged in boring ways and half a page beats
+// no page — but it has to be REPORTED leniency.
+struct Status {
+    int streams = 0;        //!< compressed streams decoded
+    int short_streams = 0;  //!< ...of those, ones that ended before their last block
+    bool complete() const { return short_streams == 0; }
+};
+
 // ---------------------------------------------------------------- DEFLATE
 struct BitReader {
     const uint8_t* p; size_t n, pos = 0; uint32_t bitbuf = 0; int bitcnt = 0;
@@ -77,7 +95,8 @@ struct Huff {
     }
 };
 
-inline bool inflate_raw(const uint8_t* src, size_t srclen, std::string& out) {
+inline bool inflate_raw(const uint8_t* src, size_t srclen, std::string& out,
+                        bool* ended_early = nullptr) {
     static const int LBASE[] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
     static const int LEXT[]  = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
     static const int DBASE[] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
@@ -85,12 +104,15 @@ inline bool inflate_raw(const uint8_t* src, size_t srclen, std::string& out) {
 
     BitReader br(src, srclen);
     Huff fixedL, fixedD; bool fixedReady = false;
+    // Every early exit goes through here, so "ended before the final block" is
+    // recorded once and cannot be forgotten at a new return site.
+    auto bail = [&]() { if (ended_early) *ended_early = true; return !out.empty(); };
     for (;;) {
-        int last = br.bit(); if (last < 0) return !out.empty();
-        int type = br.bits(2); if (type < 0) return !out.empty();
+        int last = br.bit(); if (last < 0) return bail();
+        int type = br.bits(2); if (type < 0) return bail();
         if (type == 0) {                                   // stored
             br.align();
-            if (br.pos + 4 > br.n) return !out.empty();
+            if (br.pos + 4 > br.n) return bail();
             int len = src[br.pos] | (src[br.pos + 1] << 8); br.pos += 4;
             if (br.pos + len > br.n) len = (int)(br.n - br.pos);
             out.append((const char*)src + br.pos, len); br.pos += len;
@@ -109,46 +131,51 @@ inline bool inflate_raw(const uint8_t* src, size_t srclen, std::string& out) {
                 pl = &fixedL; pd = &fixedD;
             } else {
                 static const int ORD[] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
-                int hlit = br.bits(5) + 257, hdist = br.bits(5) + 1, hclen = br.bits(4) + 4;
-                if (hlit < 257) return !out.empty();
+                int h1 = br.bits(5), h2 = br.bits(5), h3 = br.bits(4);
+                if (h1 < 0 || h2 < 0 || h3 < 0) return bail();
+                int hlit = h1 + 257, hdist = h2 + 1, hclen = h3 + 4;
                 uint8_t clen[19] = {0};
-                for (int i = 0; i < hclen; i++) { int v = br.bits(3); if (v < 0) return !out.empty(); clen[ORD[i]] = (uint8_t)v; }
+                for (int i = 0; i < hclen; i++) { int v = br.bits(3); if (v < 0) return bail(); clen[ORD[i]] = (uint8_t)v; }
                 Huff C; C.build(clen, 19);
                 std::vector<uint8_t> lens(hlit + hdist, 0);
                 for (int i = 0; i < hlit + hdist;) {
-                    int sym = C.decode(br); if (sym < 0) return !out.empty();
+                    int sym = C.decode(br); if (sym < 0) return bail();
                     if (sym < 16) lens[i++] = (uint8_t)sym;
-                    else if (sym == 16) { if (!i) return !out.empty(); int r = 3 + br.bits(2); uint8_t prev = lens[i-1]; while (r-- && i < (int)lens.size()) lens[i++] = prev; }
-                    else if (sym == 17) { int r = 3 + br.bits(3); while (r-- && i < (int)lens.size()) lens[i++] = 0; }
-                    else { int r = 11 + br.bits(7); while (r-- && i < (int)lens.size()) lens[i++] = 0; }
+                    else if (sym == 16) { if (!i) return bail(); int rb = br.bits(2); if (rb < 0) return bail();
+                                          int r = 3 + rb; uint8_t prev = lens[i-1]; while (r-- && i < (int)lens.size()) lens[i++] = prev; }
+                    else if (sym == 17) { int rb = br.bits(3); if (rb < 0) return bail(); int r = 3 + rb; while (r-- && i < (int)lens.size()) lens[i++] = 0; }
+                    else { int rb = br.bits(7); if (rb < 0) return bail(); int r = 11 + rb; while (r-- && i < (int)lens.size()) lens[i++] = 0; }
                 }
                 L.build(lens.data(), hlit); D.build(lens.data() + hlit, hdist);
                 pl = &L; pd = &D;
             }
             for (;;) {
-                int sym = pl->decode(br); if (sym < 0) return !out.empty();
+                int sym = pl->decode(br); if (sym < 0) return bail();
                 if (sym < 256) out.push_back((char)sym);
                 else if (sym == 256) break;
                 else {
-                    sym -= 257; if (sym >= 29) return !out.empty();
-                    int len = LBASE[sym] + br.bits(LEXT[sym]);
-                    int ds = pd->decode(br); if (ds < 0 || ds >= 30) return !out.empty();
-                    int dist = DBASE[ds] + br.bits(DEXT[ds]);
-                    if ((size_t)dist > out.size()) return !out.empty();
+                    sym -= 257; if (sym >= 29) return bail();
+                    int lx = br.bits(LEXT[sym]); if (lx < 0) return bail();
+                    int len = LBASE[sym] + lx;
+                    int ds = pd->decode(br); if (ds < 0 || ds >= 30) return bail();
+                    int dx = br.bits(DEXT[ds]); if (dx < 0) return bail();
+                    int dist = DBASE[ds] + dx;
+                    if ((size_t)dist > out.size()) return bail();
                     size_t start = out.size() - dist;
                     for (int i = 0; i < len; i++) out.push_back(out[start + i]);
                 }
             }
-        } else return !out.empty();
+        } else return bail();
         if (last) break;
     }
     return true;
 }
 
-inline bool inflate(const uint8_t* src, size_t len, std::string& out) {
+inline bool inflate(const uint8_t* src, size_t len, std::string& out,
+                    bool* ended_early = nullptr) {
     if (len > 2 && (src[0] & 0x0f) == 8 && ((src[0] << 8 | src[1]) % 31) == 0)
-        return inflate_raw(src + 2, len - 2, out);      // zlib wrapper
-    return inflate_raw(src, len, out);                  // raw deflate
+        return inflate_raw(src + 2, len - 2, out, ended_early);  // zlib wrapper
+    return inflate_raw(src, len, out, ended_early);     // raw deflate
 }
 
 // ---------------------------------------------------------------- ASCII85
@@ -195,15 +222,26 @@ inline std::string ascii85_decode(const uint8_t* p, size_t n) {
 }
 
 // Decode a stream body through whatever filters are actually present.
-inline bool decode_stream(const uint8_t* p, size_t n, std::string& out) {
+inline bool decode_stream(const uint8_t* p, size_t n, std::string& out,
+                          bool* ended_early = nullptr) {
     if (looks_ascii85(p, n)) {
         std::string a85 = ascii85_decode(p, n);
         if (a85.empty()) return false;
-        if (inflate((const uint8_t*)a85.data(), a85.size(), out) && out.size() > 8) return true;
+        bool shortread = false;
+        if (inflate((const uint8_t*)a85.data(), a85.size(), out, &shortread) &&
+            out.size() > 8) {
+            if (shortread && ended_early) *ended_early = true;
+            return true;
+        }
         out = a85;                          // ASCII85 only, no deflate
         return out.size() > 8;
     }
-    return inflate(p, n, out) && out.size() > 8;
+    bool shortread = false;
+    bool ok = inflate(p, n, out, &shortread) && out.size() > 8;
+    // Only a stream we are actually USING can be reported short. A blob that
+    // failed to inflate at all is not a truncated stream, it is not a stream.
+    if (ok && shortread && ended_early) *ended_early = true;
+    return ok;
 }
 
 // ---------------------------------------------------------------- ToUnicode CMaps
@@ -589,7 +627,8 @@ inline void scan_content(const std::string& c, std::vector<TextItem>& out,
 }
 
 // Brute-force: find every stream, inflate what inflates, scan for text.
-inline std::vector<TextItem> extract_text(const std::vector<uint8_t>& buf) {
+inline std::vector<TextItem> extract_text(const std::vector<uint8_t>& buf,
+                                          Status* status = nullptr) {
     std::vector<TextItem> items;
     std::vector<CMap> cmaps;
     std::vector<std::string> decoded;   // decode once, use twice
@@ -620,7 +659,11 @@ inline std::vector<TextItem> extract_text(const std::vector<uint8_t>& buf) {
                 }
             }
             std::string dec;
-            if (decode_stream(&buf[s], len, dec)) { decoded.push_back(std::move(dec)); objnums.push_back(objn); }
+            bool shortread = false;
+            if (decode_stream(&buf[s], len, dec, &shortread)) {
+                if (status) { status->streams++; if (shortread) status->short_streams++; }
+                decoded.push_back(std::move(dec)); objnums.push_back(objn);
+            }
             else {
                 std::string raw((const char*)&buf[s], len);
                 if (raw.find("Tj") != std::string::npos || raw.find("TJ") != std::string::npos)
